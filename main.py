@@ -91,7 +91,7 @@ def main():
         print(f"Images with errors: {error_count}")
     
     # Write output
-    output_path = "output.csv"
+    output_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output.csv")
     print(f"\nWriting results to: {output_path}")
     
     try:

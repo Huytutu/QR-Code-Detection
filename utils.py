@@ -46,7 +46,7 @@ def write_output_csv(results, output_filename="output.csv"):
     ]
 
     with open(output_filename, mode="w", newline="", encoding="utf-8") as file:
-        writer = csv.writer(file, quoting=csv.QUOTE_ALL, escapechar="\\")
+        writer = csv.writer(file, quoting=csv.QUOTE_MINIMAL, escapechar="\\")
         writer.writerow(headers)
 
         for res in results:

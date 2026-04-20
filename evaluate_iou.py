@@ -1,179 +1,221 @@
 """
-Advanced evaluation with IoU matching against ground truth.
-Optional: for evaluating against ground_truth.csv if available.
+Evaluate output.csv against ground-truth CSV using the same greedy IoU logic
+as described in qr/output_requirement.md.
 """
+
+import argparse
 import csv
-import sys
+import os
 from pathlib import Path
+
 from shapely.geometry import Polygon
 
 
-def read_csv_results(csv_path):
-    """Read results from CSV file."""
-    results = {}
-    with open(csv_path, 'r', encoding='utf-8') as f:
-        reader = csv.DictReader(f)
+def _normalize_polygon(points):
+    """Create a valid polygon from 4-point quadrilateral coordinates."""
+    poly = Polygon(points)
+    if not poly.is_valid:
+        poly = poly.buffer(0)
+    if poly.is_empty:
+        return None
+    if getattr(poly, "geom_type", "") == "MultiPolygon":
+        poly = max(poly.geoms, key=lambda g: g.area, default=None)
+    if poly is None or poly.is_empty or poly.area <= 0:
+        return None
+    return poly
+
+
+def load_data(csv_path):
+    """Load CSV and group polygons by image_id, preserving row order per image."""
+    data = {}
+
+    if not os.path.exists(csv_path):
+        print(f"Error: file not found: {csv_path}")
+        return {}
+
+    with open(csv_path, "r", encoding="utf-8", newline="") as file:
+        reader = csv.DictReader(file)
+
+        required_columns = {
+            "image_id",
+            "qr_index",
+            "x0",
+            "y0",
+            "x1",
+            "y1",
+            "x2",
+            "y2",
+            "x3",
+            "y3",
+            "content",
+        }
+        missing = required_columns.difference(set(reader.fieldnames or []))
+        if missing:
+            print(f"Error: missing required columns in {csv_path}: {sorted(missing)}")
+            return {}
+
         for row in reader:
-            img_id = row["image_id"].strip()
-            qr_idx = row.get("qr_index", "").strip()
-            
-            if img_id not in results:
-                results[img_id] = []
-            
-            if qr_idx:  # Has QR detection
-                try:
-                    coords = [
-                        float(row["x0"].strip()),
-                        float(row["y0"].strip()),
-                        float(row["x1"].strip()),
-                        float(row["y1"].strip()),
-                        float(row["x2"].strip()),
-                        float(row["y2"].strip()),
-                        float(row["x3"].strip()),
-                        float(row["y3"].strip()),
-                    ]
-                    content = row.get("content", "").strip()
-                    
-                    results[img_id].append({
-                        "index": int(qr_idx),
-                        "coords": coords,
-                        "content": content,
-                        "polygon": Polygon([(coords[i], coords[i+1]) for i in range(0, 8, 2)])
-                    })
-                except (ValueError, IndexError):
-                    pass
-    
-    return results
+            img_id = (row.get("image_id") or "").strip()
+            if not img_id:
+                continue
+
+            if img_id not in data:
+                data[img_id] = []
+
+            qr_index = (row.get("qr_index") or "").strip()
+            if qr_index in ("", "-1"):
+                continue
+
+            try:
+                points = [
+                    (float(row["x0"].strip()), float(row["y0"].strip())),
+                    (float(row["x1"].strip()), float(row["y1"].strip())),
+                    (float(row["x2"].strip()), float(row["y2"].strip())),
+                    (float(row["x3"].strip()), float(row["y3"].strip())),
+                ]
+            except (ValueError, TypeError, KeyError, AttributeError):
+                continue
+
+            poly = _normalize_polygon(points)
+            if poly is None:
+                continue
+
+            data[img_id].append(
+                {
+                    "polygon": poly,
+                    "content": (row.get("content") or "").strip(),
+                    "qr_index": qr_index,
+                }
+            )
+
+    return data
 
 
-def compute_iou(poly1, poly2):
+def calculate_iou(poly1, poly2):
     """Compute IoU between two polygons."""
     try:
-        intersection = poly1.intersection(poly2).area
-        union = poly1.union(poly2).area
-        if union == 0:
-            return 0
-        return intersection / union
-    except:
-        return 0
+        inter_area = poly1.intersection(poly2).area
+        union_area = poly1.union(poly2).area
+        return inter_area / union_area if union_area > 0 else 0.0
+    except Exception:
+        return 0.0
 
 
-def match_detections(pred, ground_truth, iou_threshold=0.5):
-    """
-    Match predictions with ground truth using Greedy IoU Matching.
-    Returns TP, FP, FN counts.
-    """
-    tp, fp, fn = 0, 0, 0
-    
-    for img_id in set(list(pred.keys()) + list(ground_truth.keys())):
-        pred_qrs = pred.get(img_id, [])
-        gt_qrs = ground_truth.get(img_id, [])
-        
-        # Track matched GT indices per image
-        matched_gt = set()
-        
-        # For each prediction, find best GT match
-        for pred_qr in pred_qrs:
-            best_iou = 0
+def evaluate(pred_file="output.csv", gt_file="../qr/output_valid.csv", iou_threshold=0.5):
+    """Greedy IoU matching evaluation (per-image) with optional content accuracy."""
+    print("Calculating metrics...")
+
+    preds = load_data(pred_file)
+    gts = load_data(gt_file)
+
+    if not preds or not gts:
+        print("No data to evaluate.")
+        return None
+
+    all_images = set(preds.keys()).union(set(gts.keys()))
+
+    total_tp = 0
+    total_fp = 0
+    total_fn = 0
+
+    # Optional content scoring over TP matches where GT content exists.
+    content_compared = 0
+    content_correct = 0
+
+    for img_id in all_images:
+        pred_items = preds.get(img_id, [])
+        gt_items = gts.get(img_id, [])
+
+        matched_gt_indices = set()
+
+        # Keep prediction order from CSV (as in grader description).
+        for pred_item in pred_items:
+            best_iou = 0.0
             best_gt_idx = -1
-            
-            for gt_idx, gt_qr in enumerate(gt_qrs):
-                if gt_idx in matched_gt:
+
+            for gt_idx, gt_item in enumerate(gt_items):
+                if gt_idx in matched_gt_indices:
                     continue
-                iou = compute_iou(pred_qr["polygon"], gt_qr["polygon"])
+
+                iou = calculate_iou(pred_item["polygon"], gt_item["polygon"])
                 if iou > best_iou:
                     best_iou = iou
                     best_gt_idx = gt_idx
-            
+
             if best_iou >= iou_threshold and best_gt_idx >= 0:
-                tp += 1
-                matched_gt.add(best_gt_idx)
+                total_tp += 1
+                matched_gt_indices.add(best_gt_idx)
+
+                gt_content = (gt_items[best_gt_idx].get("content") or "").strip().lower()
+                pred_content = (pred_item.get("content") or "").strip().lower()
+                if gt_content:
+                    content_compared += 1
+                    if pred_content == gt_content:
+                        content_correct += 1
             else:
-                fp += 1
-        
-        # Unmatched GTs are FN
-        fn += len(gt_qrs) - len(matched_gt)
-    
-    return tp, fp, fn
+                total_fp += 1
 
+        total_fn += (len(gt_items) - len(matched_gt_indices))
 
-def evaluate_with_gt(pred_csv, gt_csv, iou_threshold=0.5):
-    """Evaluate predictions against ground truth."""
-    print(f"\n{'='*60}")
-    print(f"Evaluating with Ground Truth")
-    print(f"{'='*60}\n")
-    
-    if not Path(gt_csv).exists():
-        print(f"⚠️  Ground truth file not found: {gt_csv}")
-        print("Run evaluation without ground truth.\n")
-        return None
-    
-    print(f"Loading predictions from: {pred_csv}")
-    pred = read_csv_results(pred_csv)
-    
-    print(f"Loading ground truth from: {gt_csv}")
-    gt = read_csv_results(gt_csv)
-    
-    print(f"\nPredictions: {len(pred)} images, {sum(len(qrs) for qrs in pred.values())} QRs")
-    print(f"Ground truth: {len(gt)} images, {sum(len(qrs) for qrs in gt.values())} QRs\n")
-    
-    # Match detections
-    tp, fp, fn = match_detections(pred, gt, iou_threshold)
-    
-    # Calculate metrics
-    precision = tp / (tp + fp) if (tp + fp) > 0 else 0
-    recall = tp / (tp + fn) if (tp + fn) > 0 else 0
-    f1 = 2 * precision * recall / (precision + recall) if (precision + recall) > 0 else 0
-    
-    # Print results
-    print(f"IoU Threshold: {iou_threshold}")
-    print(f"\nDetection Results:")
-    print(f"  TP (True Positives):  {tp}")
-    print(f"  FP (False Positives): {fp}")
-    print(f"  FN (False Negatives): {fn}")
-    
-    print(f"\nMetrics:")
-    print(f"  Precision: {precision:.4f}")
-    print(f"  Recall:    {recall:.4f}")
-    print(f"  F1 Score:  {f1:.4f}")
-    
-    print("="*60 + "\n")
-    
+    precision = total_tp / (total_tp + total_fp) if (total_tp + total_fp) > 0 else 0.0
+    recall = total_tp / (total_tp + total_fn) if (total_tp + total_fn) > 0 else 0.0
+    f1_score = (
+        2 * (precision * recall) / (precision + recall)
+        if (precision + recall) > 0
+        else 0.0
+    )
+
+    print("\n" + "=" * 60)
+    print("EVALUATION REPORT")
+    print("=" * 60)
+    print(f"Images evaluated        : {len(all_images)}")
+    print(f"IoU threshold           : {iou_threshold}")
+    print(f"TP (True Positives)     : {total_tp}")
+    print(f"FP (False Positives)    : {total_fp}")
+    print(f"FN (False Negatives)    : {total_fn}")
+    print("-" * 60)
+    print(f"Precision               : {precision:.4f}")
+    print(f"Recall                  : {recall:.4f}")
+    print(f"F1 Score                : {f1_score:.4f}")
+
+    if content_compared > 0:
+        content_accuracy = content_correct / content_compared
+        print(f"Content Accuracy (opt.) : {content_accuracy:.4f} ({content_correct}/{content_compared})")
+    else:
+        print("Content Accuracy (opt.) : N/A (no GT content to compare)")
+
+    print("=" * 60)
+
     return {
-        "tp": tp,
-        "fp": fp,
-        "fn": fn,
+        "tp": total_tp,
+        "fp": total_fp,
+        "fn": total_fn,
         "precision": precision,
         "recall": recall,
-        "f1": f1
+        "f1": f1_score,
+        "content_compared": content_compared,
+        "content_correct": content_correct,
     }
 
 
 def main():
-    pred_csv = "output.csv"
-    
-    # Check if output.csv exists
-    if not Path(pred_csv).exists():
-        print(f"❌ {pred_csv} not found")
-        sys.exit(1)
-    
-    # Look for ground truth
-    gt_candidates = [
-        "../qr/output_valid.csv",
-    ]
-    
-    gt_csv = None
-    for candidate in gt_candidates:
-        if Path(candidate).exists():
-            gt_csv = candidate
-            break
-    
-    if gt_csv:
-        evaluate_with_gt(pred_csv, gt_csv)
-    else:
-        print("\n⚠️  Ground truth not found. Skipping IoU evaluation.")
-        print("To evaluate with IoU metrics, provide ground_truth.csv\n")
+    parser = argparse.ArgumentParser(description="Evaluate output.csv with greedy IoU matching")
+    parser.add_argument("--pred", default="output.csv", help="Prediction CSV path")
+    parser.add_argument("--gt", default="../qr/output_valid.csv", help="Ground-truth CSV path")
+    parser.add_argument("--iou", type=float, default=0.5, help="IoU threshold (default: 0.5)")
+    args = parser.parse_args()
+
+    if not Path(args.pred).exists():
+        print(f"Error: prediction file not found: {args.pred}")
+        return 1
+
+    if not Path(args.gt).exists():
+        print(f"Error: ground-truth file not found: {args.gt}")
+        return 1
+
+    result = evaluate(pred_file=args.pred, gt_file=args.gt, iou_threshold=args.iou)
+    return 0 if result is not None else 1
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
