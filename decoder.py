@@ -17,7 +17,7 @@ class QRDecode:
         version = (size - 17) // 4
         if self.debug:
             print(f"[DEBUG] get_version: Matrix size = {size}, computed version = {version}")
-            print(f"[DEBUG] get_version: Expected matrix size for this version = {17 + 4 * version}")
+            print(f"[DEBUG] get_version: Expected matrix size fo r this version = {17 + 4 * version}")
         return version
 
     def mark_function_modules(self) -> np.ndarray:
@@ -185,42 +185,83 @@ class QRDecode:
         return compute_alignment_positions(version)
 
     def extract_format_information(self) -> tuple[str, int]:
-        """Extract format information from the QR code."""
-        
-        first_copy = 0
-        for col in [0, 1, 2, 3, 4, 5, 7, 8]:
-            first_copy = (first_copy << 1) | (self.matrix[8][col] & 1)
-            if self.verbose:
-                print(f"[DEBUG] extract_format_information: first_copy after col {col} = {first_copy:0b}")
+        """Extract and BCH-correct format information from both format copies."""
+        size = len(self.matrix)
 
-        second_copy = 0
-        for row in [0, 1, 2, 3, 4, 5, 7]:
-            second_copy = (second_copy << 1) | (self.matrix[row][8] & 1)
-            if self.verbose:
-                print(f"[DEBUG] extract_format_information: second_copy after row {row} = {second_copy:0b}")
+        def read_bits(positions: list[tuple[int, int]]) -> int:
+            value = 0
+            for r, c in positions:
+                value = (value << 1) | (self.matrix[r][c] & 1)
+            return value
 
-        raw_format = (first_copy << 7) | second_copy
+        def build_format_codeword(data_5bits: int) -> int:
+            # BCH(15,5) using generator polynomial 0x537, then apply mask 0x5412.
+            g = 0x537
+            code = data_5bits << 10
+            for i in range(14, 9, -1):
+                if (code >> i) & 1:
+                    code ^= g << (i - 10)
+            remainder = code & 0x3FF
+            return ((data_5bits << 10) | remainder) ^ 0x5412
+
+        def hamming_distance(a: int, b: int) -> int:
+            return (a ^ b).bit_count()
+
+        # Copy near top-left, bit order follows QR spec (MSB -> LSB).
+        tl_positions = [
+            (8, 0), (8, 1), (8, 2), (8, 3), (8, 4), (8, 5),
+            (8, 7), (8, 8), (7, 8),
+            (5, 8), (4, 8), (3, 8), (2, 8), (1, 8), (0, 8),
+        ]
+
+        # Copy near top-right / bottom-left, same logical bit order.
+        tr_bl_positions = [
+            (size - 1, 8), (size - 2, 8), (size - 3, 8), (size - 4, 8),
+            (size - 5, 8), (size - 6, 8), (size - 7, 8),
+            (8, size - 8), (8, size - 7), (8, size - 6), (8, size - 5),
+            (8, size - 4), (8, size - 3), (8, size - 2), (8, size - 1),
+        ]
+
+        copy1 = read_bits(tl_positions)
+        copy2 = read_bits(tr_bl_positions)
+
         if self.verbose:
-            print(f"[DEBUG] extract_format_information: Raw format (before unmask) = {raw_format:015b}")
+            print(f"[DEBUG] extract_format_information: copy1={copy1:015b}, copy2={copy2:015b}")
 
-        # Unmask the format bits using the mask 0x5412
-        format_info = raw_format ^ 0x5412
-        if self.verbose:
-            print(f"[DEBUG] extract_format_information: Format info (after unmask) = {format_info:015b}")
+        best_data = None
+        best_dist = 1_000_000
+        best_source = ""
 
-        # Extract the 5 format data bits (bits 14 to 10) as per QR spec
-        data_bits = (format_info >> 10) & 0b11111
-        if self.debug:
-            print(f"[DEBUG] extract_format_information: Data bits = {data_bits:05b}")
+        for data_bits in range(32):
+            valid_codeword = build_format_codeword(data_bits)
+            d1 = hamming_distance(copy1, valid_codeword)
+            d2 = hamming_distance(copy2, valid_codeword)
+            if d1 < best_dist:
+                best_dist = d1
+                best_data = data_bits
+                best_source = "copy1"
+            if d2 < best_dist:
+                best_dist = d2
+                best_data = data_bits
+                best_source = "copy2"
 
-        # The first two bits (bits 4-3) are error correction level, and the last three bits (bits 2-0) are mask pattern
+        if best_data is None or best_dist > 3:
+            # Fallback to copy1 raw decode if BCH correction fails.
+            if self.debug:
+                print("[DEBUG] extract_format_information: BCH correction failed, fallback to copy1 raw")
+            format_info = copy1 ^ 0x5412
+            best_data = (format_info >> 10) & 0b11111
+        elif self.debug:
+            print(f"[DEBUG] extract_format_information: selected {best_source}, distance={best_dist}")
+
         error_correction = {
             0b00: 'M',
             0b01: 'L',
             0b10: 'H',
-            0b11: 'Q'
-        }[(data_bits >> 3) & 0b11]
-        mask_pattern = data_bits & 0b111
+            0b11: 'Q',
+        }[(best_data >> 3) & 0b11]
+        mask_pattern = best_data & 0b111
+
         if self.debug:
             print(f"[DEBUG] extract_format_information: Extracted error correction = {error_correction}, mask pattern = {mask_pattern}")
 
@@ -803,52 +844,60 @@ class QRDecode:
             print(f"[DEBUG] _extract_blocks: Data blocks info: {data_blocks_info}")
             print(f"[DEBUG] _extract_blocks: EC blocks info: {ec_blocks_info}")
         
-        # Convert bits to bytes
-        data_bytes = []
+        # Convert raw codeword bits to bytes.
+        raw_codewords = []
         for i in range(0, len(data_bits), 8):
             if i + 8 <= len(data_bits):
                 byte = int(''.join(str(bit) for bit in data_bits[i:i+8]), 2)
-                data_bytes.append(byte)
+            raw_codewords.append(byte)
         
         if self.debug:
-            print(f"[DEBUG] _extract_blocks: Total bytes: {len(data_bytes)}")
-        
-        # Calculate total number of blocks
-        total_data_blocks = sum(count for count, _ in data_blocks_info)
-        
-        # Initialize empty blocks
-        data_blocks = [[] for _ in range(total_data_blocks)]
-        ec_blocks = [[] for _ in range(total_data_blocks)]
-        
-        # First, distribute data bytes
-        pos = 0
-        block_sizes = []
+            print(f"[DEBUG] _extract_blocks: Total codewords: {len(raw_codewords)}")
+
+        total_blocks = sum(count for count, _ in data_blocks_info)
+
+        data_sizes = []
         for count, size in data_blocks_info:
-            block_sizes.extend([size] * count)
-        
-        # Distribute bytes in order
-        max_size = max(block_sizes)
-        for i in range(max_size):
-            for j in range(total_data_blocks):
-                if i < block_sizes[j] and pos < len(data_bytes):
-                    data_blocks[j].append(data_bytes[pos])
-                    pos += 1
-        
-        # Now distribute error correction bytes
-        # Calculate total EC bytes needed
-        total_ec_bytes = sum(count * size for count, size in ec_blocks_info)
-        if self.debug:
-            print(f"[DEBUG] _extract_blocks: Total EC bytes needed: {total_ec_bytes}")
-        
-        # Get EC block sizes
+            data_sizes.extend([size] * count)
+
         ec_sizes = []
         for count, size in ec_blocks_info:
             ec_sizes.extend([size] * count)
-        
-        # Initialize EC blocks with zeros
-        for i in range(total_data_blocks):
-            ec_blocks[i] = [0] * ec_sizes[i]
-        
+
+        if len(data_sizes) != total_blocks or len(ec_sizes) != total_blocks:
+            # Fallback for malformed metadata.
+            if self.debug:
+                print("[DEBUG] _extract_blocks: block metadata mismatch, fallback to single block")
+            data_sizes = [len(raw_codewords)]
+            ec_sizes = [0]
+            total_blocks = 1
+
+        data_blocks = [[] for _ in range(total_blocks)]
+        ec_blocks = [[] for _ in range(total_blocks)]
+
+        # De-interleave data codewords.
+        pos = 0
+        max_data_size = max(data_sizes) if data_sizes else 0
+        for i in range(max_data_size):
+            for j in range(total_blocks):
+                if i < data_sizes[j] and pos < len(raw_codewords):
+                    data_blocks[j].append(raw_codewords[pos])
+                    pos += 1
+
+        # De-interleave EC codewords.
+        max_ec_size = max(ec_sizes) if ec_sizes else 0
+        for i in range(max_ec_size):
+            for j in range(total_blocks):
+                if i < ec_sizes[j] and pos < len(raw_codewords):
+                    ec_blocks[j].append(raw_codewords[pos])
+                    pos += 1
+
+        # Pad missing EC bytes if stream truncated.
+        for i in range(total_blocks):
+            missing = ec_sizes[i] - len(ec_blocks[i])
+            if missing > 0:
+                ec_blocks[i].extend([0] * missing)
+
         if self.debug:
             for i, (data, ec) in enumerate(zip(data_blocks, ec_blocks)):
                 print(f"[DEBUG] _extract_blocks: Block {i}: {len(data)} data bytes, {len(ec)} EC bytes")
@@ -956,20 +1005,34 @@ class QRDecode:
         if len(err_pos) != len(err_loc) - 1:
             return msg_in[:-nsym]  # Too many errors to correct
             
-        # Find error values and correct
+        # Find error values and correct using Forney algorithm.
         msg_out = list(msg_in)
+
+        # Error evaluator polynomial omega(x) = (S(x) * sigma(x)) mod x^nsym.
+        eval_poly = self._gf_poly_mult(syndromes, err_loc)
+        eval_poly = eval_poly[-nsym:] if len(eval_poly) > nsym else eval_poly
+
+        # Formal derivative sigma'(x) in characteristic 2 (keep odd powers only).
+        err_loc_prime = []
+        degree = len(err_loc) - 1
+        for idx, coef in enumerate(err_loc):
+            power = degree - idx
+            if power % 2 == 1:
+                err_loc_prime.append(coef)
+
+        if not err_loc_prime:
+            err_loc_prime = [1]
+
         for i in range(len(err_pos)):
             pos = err_pos[i]
-            
-            # Compute error evaluator polynomial
-            eval_poly = self._gf_poly_mult(syndromes, err_loc)
-            eval_poly = eval_poly[len(eval_poly)-len(err_loc):]
-            
-            # Compute error value
+
             xi_inv = self._gf_pow(2, 255-pos)
-            err_val = self._gf_poly_eval(eval_poly, xi_inv)
-            err_val = self._gf_mult(err_val, self._gf_inverse(self._gf_poly_eval(self._gf_poly_scale(err_loc, xi_inv), xi_inv)))
-            
+            numerator = self._gf_poly_eval(eval_poly, xi_inv)
+            denominator = self._gf_poly_eval(err_loc_prime, xi_inv)
+            if denominator == 0:
+                continue
+            err_val = self._gf_mult(numerator, self._gf_inverse(denominator))
+
             msg_out[pos] ^= err_val
             
         return msg_out[:-nsym]  # Remove error correction bytes
@@ -1052,8 +1115,6 @@ class QRDecode:
 
 
 if __name__ == "__main__":
-    #qr_code = QRCode('https://cs.unibuc.ro/~crusu/asc/index.html', version=-1, error_correction='H', mask=-1, debug=False, mode="byte")
-    # qr_code.draw()
     qr_code = QRCode('https://cs.unibuc.ro/~crusu/asc/index.html', version=-1, error_correction='L', mask=-1, debug=False, mode="auto")
     data_bits = qr_code.get_matrix()
     version = qr_code.get_version()

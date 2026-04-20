@@ -10,7 +10,7 @@ from utils import is_valid_qr_triangle, get_image_paths, write_output_csv
 
 
 # ============================================================================
-# PCA MODEL LOADING & DISTANCE CALCULATION (from _insert_pca_cell.ps1)
+# PCA MODEL LOADING & DISTANCE CALCULATION
 # ============================================================================
 
 _PCA_MODEL_CACHE = None
@@ -79,7 +79,7 @@ def _pca_distance_from_box(source_img, qr_box, size=20):
 
 
 # ============================================================================
-# PREPROCESSING FUNCTIONS (from pipeline copy 4.ipynb)
+# PREPROCESSING FUNCTIONS
 # ============================================================================
 
 def preprocess_image(img):
