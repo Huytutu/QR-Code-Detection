@@ -42,9 +42,10 @@ def _load_pca_model():
         return None
 
 
-def _pca_distance_from_box(source_img, qr_box, size=20):
+def _pca_distance_from_box(source_img, qr_box, size=20, model=None):
     """Compute PCA distance for a QR candidate box."""
-    model = _load_pca_model()
+    if model is None:
+        model = _load_pca_model()
     if model is None:
         return None
     
@@ -188,7 +189,7 @@ def apply_nms(qrs_list, distance_threshold=20):
 # VERIFICATION FUNCTION
 # ============================================================================
 
-def verify_qr_soft(img, qr_box, mode="default"):
+def verify_qr_soft(img, qr_box, mode="default", pca_model=None):
     """Verify if a box is a valid QR code using visual characteristics + PCA."""
     try:
         # Extract 4 corners
@@ -249,9 +250,9 @@ def verify_qr_soft(img, qr_box, mode="default"):
                 return False
         
         # Check 3: PCA-based gating
-        model = _load_pca_model()
+        model = pca_model if pca_model is not None else _load_pca_model()
         if model is not None:
-            d = _pca_distance_from_box(img, qr_box)
+            d = _pca_distance_from_box(img, qr_box, model=model)
             if d is not None:
                 limit = model["threshold"] * (1.10 if mode == "dense_small" else 0.95)
                 if d > limit:
@@ -673,12 +674,13 @@ def get_finder_patterns(work_mask, min_area=240):
         filtered_qrs.append(q)
     final_qrs = filtered_qrs
     
-    # PCA-based ranking (from PowerShell script)
+    # PCA-based ranking
+    model = _load_pca_model()
+    work_mask_bgr = work_mask if len(work_mask.shape) == 3 else cv2.cvtColor(work_mask, cv2.COLOR_GRAY2BGR)
     scored_qrs = []
     for q in final_qrs:
-        model = _load_pca_model()
         if model is not None:
-            d = _pca_distance_from_box(work_mask if len(work_mask.shape) == 3 else cv2.cvtColor(work_mask, cv2.COLOR_GRAY2BGR), q)
+            d = _pca_distance_from_box(work_mask_bgr, q, model=model)
             if d is None or d <= model["threshold"] * 1.25:
                 scored_qrs.append((1e9 if d is None else d, q))
         else:
@@ -706,45 +708,62 @@ def detect_qr_codes(img_path):
     
     # Preprocessing
     mask_fine, mask_coarse, _ = preprocess_image(img)
-    morph_img = preprocessing_for_FP(img)
     
     # Get candidate QR boxes from multiple sources
     qrs_fine = get_small_bounding_boxes(mask_fine, min_area=300)
     qrs_coarse_1 = get_big_bounding_boxes(mask_fine)
     qrs_coarse_2 = get_big_bounding_boxes(mask_coarse)
     qrs_finder_patterns_fine = get_finder_patterns(mask_fine)
-    qrs_finder_patterns_thresh = get_finder_patterns(morph_img)
+
+    # Lazy-load threshold-based finder branch only when needed.
+    qrs_finder_patterns_thresh = None
+
+    def _get_qrs_finder_patterns_thresh():
+        nonlocal qrs_finder_patterns_thresh
+        if qrs_finder_patterns_thresh is None:
+            morph_img = preprocessing_for_FP(img)
+            qrs_finder_patterns_thresh = get_finder_patterns(morph_img)
+        return qrs_finder_patterns_thresh
+
+    dense_small_mode = len(qrs_fine) >= 20
+
+    pca_model = _load_pca_model()
+
+    def _verify_branch(branch_qrs):
+        verify_mode = "dense_small" if (branch_qrs is qrs_fine and dense_small_mode) else "default"
+        return [
+            qr for qr in branch_qrs
+            if verify_qr_soft(img, qr, mode=verify_mode, pca_model=pca_model)
+        ]
     
     # Selection strategy
     if qrs_finder_patterns_fine:
         qrs = qrs_finder_patterns_fine
     elif qrs_fine:
         qrs = qrs_fine
-    elif len(qrs_finder_patterns_thresh) > 0 and len(qrs_coarse_1 + qrs_coarse_2) < 2:
-        qrs = qrs_finder_patterns_thresh
     else:
-        qrs = qrs_coarse_1 if qrs_coarse_1 else qrs_coarse_2
-    
-    dense_small_mode = len(qrs_fine) >= 20
-    
+        coarse_count = len(qrs_coarse_1) + len(qrs_coarse_2)
+        if coarse_count < 2:
+            thresh_branch = _get_qrs_finder_patterns_thresh()
+            qrs = thresh_branch if thresh_branch else (qrs_coarse_1 if qrs_coarse_1 else qrs_coarse_2)
+        else:
+            qrs = qrs_coarse_1 if qrs_coarse_1 else qrs_coarse_2
+
     # Verification
-    verified_qrs = []
-    for qr in qrs:
-        verify_mode = "dense_small" if (qrs is qrs_fine and dense_small_mode) else "default"
-        if verify_qr_soft(img, qr, mode=verify_mode):
-            verified_qrs.append(qr)
-    
+    verified_qrs = _verify_branch(qrs)
+
     # Fallback chain
     if not verified_qrs:
-        fallback_order = [qrs_finder_patterns_thresh, qrs_coarse_2, qrs_coarse_1, qrs_fine]
+        fallback_order = [
+            _get_qrs_finder_patterns_thresh(),
+            qrs_coarse_2,
+            qrs_coarse_1,
+            qrs_fine,
+        ]
         for branch_qrs in fallback_order:
-            branch_verified = []
-            for qr in branch_qrs:
-                verify_mode = "dense_small" if (branch_qrs is qrs_fine and dense_small_mode) else "default"
-                if verify_qr_soft(img, qr, mode=verify_mode):
-                    branch_verified.append(qr)
+            branch_verified = _verify_branch(branch_qrs)
             if branch_verified:
                 verified_qrs = branch_verified
                 break
-    
+
     return verified_qrs
